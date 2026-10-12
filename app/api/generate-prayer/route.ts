@@ -17,6 +17,18 @@ const MODELS = [
   "gemini-2.5-flash",
 ].filter((m, i, arr): m is string => Boolean(m) && arr.indexOf(m) === i);
 
+// Search grounding is slower (often 10-30s) and can hit serverless time limits.
+// It is OFF by default; set PRAYER_GROUNDING=on to enable it.
+const GROUNDING = process.env.PRAYER_GROUNDING?.toLowerCase() === "on";
+
+// Stop starting new attempts after this many ms so we always answer with JSON
+// before the host (Netlify/Vercel) kills the function.
+const BUDGET_MS = Number(process.env.PRAYER_BUDGET_MS) || 22000;
+
+// Remembered across warm invocations so dead models aren't retried each time.
+let workingModel: string | null = null;
+const deadModels = new Set<string>();
+
 function isModelUnavailable(err: unknown): boolean {
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return (
@@ -79,6 +91,8 @@ function extractJson(text: string): unknown {
 function explainError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
   const lower = msg.toLowerCase();
+  if (lower.includes("abort") || lower.includes("timeout") || lower.includes("timed out"))
+    return "Composing your prayer took too long. Please try again.";
   if (lower.includes("api key") && (lower.includes("invalid") || lower.includes("not valid")))
     return "The Gemini API key looks invalid. Please re-check GEMINI_API_KEY.";
   if (lower.includes("429") || lower.includes("quota") || lower.includes("resource_exhausted"))
@@ -128,17 +142,26 @@ export async function POST(req: Request) {
 
   // For each model: try with Google Search grounding first, then without.
   // A model the key can't access is skipped straight to the next one.
-  const attempts: { model: string; grounded: boolean }[] = MODELS.flatMap(
-    (model) => [
-      { model, grounded: true },
-      { model, grounded: false },
-    ]
+  const ordered = workingModel
+    ? [workingModel, ...MODELS.filter((m) => m !== workingModel)]
+    : MODELS;
+  const attempts: { model: string; grounded: boolean }[] = ordered.flatMap(
+    (model) =>
+      GROUNDING
+        ? [
+            { model, grounded: true },
+            { model, grounded: false },
+          ]
+        : [{ model, grounded: false }]
   );
   let lastError: unknown = null;
-  const skipped = new Set<string>();
+  const skipped = new Set<string>(deadModels);
+  const startedAt = Date.now();
 
   for (const { model, grounded } of attempts) {
     if (skipped.has(model)) continue;
+    const remaining = BUDGET_MS - (Date.now() - startedAt);
+    if (remaining < 4000) break; // not enough time left for another try
     try {
       // JSON response mode can't be combined with Search grounding,
       // so grounded calls ask for raw JSON in the prompt and parse it.
@@ -146,8 +169,16 @@ export async function POST(req: Request) {
         model,
         contents: buildPrompt(situation, language, body.preferredDeity, grounded),
         config: grounded
-          ? { tools: [{ googleSearch: {} }], temperature: 0.8 }
-          : { responseMimeType: "application/json", temperature: 0.8 },
+          ? {
+              tools: [{ googleSearch: {} }],
+              temperature: 0.8,
+              abortSignal: AbortSignal.timeout(remaining),
+            }
+          : {
+              responseMimeType: "application/json",
+              temperature: 0.8,
+              abortSignal: AbortSignal.timeout(remaining),
+            },
       });
 
       const parsed = extractJson(response.text ?? "") as PrayerResult;
@@ -191,10 +222,14 @@ export async function POST(req: Request) {
         console.error("Saving prayer failed:", e);
       }
 
+      workingModel = model;
       return NextResponse.json({ ...result, id });
     } catch (err) {
       lastError = err;
-      if (isModelUnavailable(err)) skipped.add(model);
+      if (isModelUnavailable(err)) {
+        skipped.add(model);
+        deadModels.add(model);
+      }
       console.error(
         `generate-prayer attempt failed (model=${model}, grounded=${grounded}):`,
         err
