@@ -5,9 +5,27 @@ import { savePrayer } from "@/lib/firebase";
 
 export const maxDuration = 60;
 
-// Flash works on free-tier keys and is much faster than Pro.
-// Override with the GEMINI_MODEL env var (e.g. gemini-2.5-pro).
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+// Models are tried in order; any the key can't access is skipped.
+// Set GEMINI_MODEL to force a specific one first.
+// (gemini-2.5-* is now limited to past users, so it is only a last resort.)
+const MODELS = [
+  process.env.GEMINI_MODEL?.trim(),
+  "gemini-3.6-flash",
+  "gemini-3.8-flash",
+  "gemini-3.5-flash-lite",
+  "gemini-3.1-flash-lite",
+  "gemini-2.5-flash",
+].filter((m, i, arr): m is string => Boolean(m) && arr.indexOf(m) === i);
+
+function isModelUnavailable(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return (
+    msg.includes("404") ||
+    msg.includes("not found") ||
+    msg.includes("is not supported") ||
+    msg.includes("no longer available")
+  );
+}
 
 function buildPrompt(
   situation: string,
@@ -64,9 +82,9 @@ function explainError(err: unknown): string {
   if (lower.includes("api key") && (lower.includes("invalid") || lower.includes("not valid")))
     return "The Gemini API key looks invalid. Please re-check GEMINI_API_KEY.";
   if (lower.includes("429") || lower.includes("quota") || lower.includes("resource_exhausted"))
-    return "The Gemini quota for this key is used up or not available for this model. Try GEMINI_MODEL=gemini-2.5-flash or enable billing.";
-  if (lower.includes("404") || lower.includes("not found") || lower.includes("is not supported"))
-    return "The selected Gemini model isn't available to this key. Set GEMINI_MODEL to gemini-2.5-flash.";
+    return "The Gemini quota for this key is used up or not available yet. Please try again shortly, or enable billing in Google AI Studio.";
+  if (isModelUnavailable(err))
+    return "None of the configured Gemini models are available to this key. Set GEMINI_MODEL to a current model from ai.google.dev/gemini-api/docs/models.";
   if (lower.includes("403") || lower.includes("permission"))
     return "This Gemini key doesn't have permission for that request. Check the key's project and API access.";
   return "We couldn't compose your prayer just now. Please try again.";
@@ -108,17 +126,24 @@ export async function POST(req: Request) {
 
   const ai = new GoogleGenAI({ apiKey });
 
-  // Try with Google Search grounding first. If that fails for any reason
-  // (tier not allowed, quota, bad JSON) retry once without grounding.
-  const attempts: boolean[] = [true, false];
+  // For each model: try with Google Search grounding first, then without.
+  // A model the key can't access is skipped straight to the next one.
+  const attempts: { model: string; grounded: boolean }[] = MODELS.flatMap(
+    (model) => [
+      { model, grounded: true },
+      { model, grounded: false },
+    ]
+  );
   let lastError: unknown = null;
+  const skipped = new Set<string>();
 
-  for (const grounded of attempts) {
+  for (const { model, grounded } of attempts) {
+    if (skipped.has(model)) continue;
     try {
       // JSON response mode can't be combined with Search grounding,
       // so grounded calls ask for raw JSON in the prompt and parse it.
       const response = await ai.models.generateContent({
-        model: MODEL,
+        model,
         contents: buildPrompt(situation, language, body.preferredDeity, grounded),
         config: grounded
           ? { tools: [{ googleSearch: {} }], temperature: 0.8 }
@@ -169,8 +194,9 @@ export async function POST(req: Request) {
       return NextResponse.json({ ...result, id });
     } catch (err) {
       lastError = err;
+      if (isModelUnavailable(err)) skipped.add(model);
       console.error(
-        `generate-prayer attempt failed (model=${MODEL}, grounded=${grounded}):`,
+        `generate-prayer attempt failed (model=${model}, grounded=${grounded}):`,
         err
       );
     }
