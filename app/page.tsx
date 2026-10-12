@@ -31,7 +31,15 @@ export default function Home() {
           preferredDeity: deityOverride ?? deity,
         }),
       });
-      const json = await res.json();
+      const raw = await res.text();
+      let json: any = null;
+      try {
+        json = JSON.parse(raw);
+      } catch {
+        throw new Error(
+          "The server took too long or returned an error. Please try again."
+        );
+      }
       if (!res.ok) throw new Error(json.error || "Something went wrong.");
       setResult(json);
       if (deityOverride) setDeity(deityOverride);
