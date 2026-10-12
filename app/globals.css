@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html {
+  background: #10101e;
+}
+
+body {
+  background: #1a1a2e;
+  color: #fdfbf7;
+}
+
+/* Diya-style saffron glow behind the prayer card */
+.diya-glow {
+  position: absolute;
+  inset: -40px;
+  z-index: -1;
+  background: radial-gradient(
+    ellipse at 50% 30%,
+    rgba(255, 153, 51, 0.38),
+    rgba(212, 175, 55, 0.12) 45%,
+    transparent 70%
+  );
+  filter: blur(30px);
+}
+
+::selection {
+  background: rgba(255, 153, 51, 0.4);
+}
